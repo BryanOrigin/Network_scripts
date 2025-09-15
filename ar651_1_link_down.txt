@@ -1,0 +1,196 @@
+Huawei AR651 SNMP Filter Script — Final Version
+===============================================
+
+Purpose
+--------
+This Python 3 script scans a list of IP subnets for SNMP-enabled switches and filters them based on the following rules
+
+1. Either GE008 or GE009 must be DOWN (operational status = 2)
+2. If the DOWN interface has a non-default description
+   → Add to output with note 1 link down
+3. If the DOWN interface has the default Huawei description
+   → Add to output with note 2nd link not provided
+4. All other cases are skipped
+
+Default Huawei description format
+  HUAWEI, AR Series, GigabitEthernet00x Interface
+
+Output
+-------
+Matching switches are saved to
+  textfolderar651_filtered_switches.txt
+
+Each line includes
+  IP - sysName - [status note]
+
+Examples
+  10.197.0.8 - Browntape - 1 link down
+  10.197.0.9 - Rajan_LCO - GE008 down (default desc) → 2nd link not provided
+
+Console output is minimal
+  IP — Unreachable
+  IP — Pingable but SNMP failed
+  IP — Pingable but missing interface indexes
+  IP — Pingable but no match
+  IP — Added (with note)
+
+Setup Instructions (Linux)
+---------------------------
+Run these commands on a new Linux machine before executing the script
+
+1. Install Python 3
+   sudo apt update
+   sudo apt install python3
+
+2. Install SNMP tools
+   sudo apt install snmp
+
+3. Install ping utility (if missing)
+   sudo apt install iputils-ping
+
+4. Create output folder
+   mkdir -p textfolder
+
+5. Run the script
+   python3 ar651_filter.py
+
+Quick one-liner setup
+----------------------
+sudo apt update && sudo apt install -y python3 snmp iputils-ping && mkdir -p textfolder
+
+Source Code
+------------
+Save the following as ar651_filter.py
+
+[START OF SCRIPT]
+
+#!usrbinenv python3
+import re
+import subprocess
+import ipaddress
+import platform
+
+def ping_host(host)
+    param = -n if platform.system().lower() == windows else -c
+    try
+        result = subprocess.run([ping, param, 1, host],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        return result.returncode == 0
+    except Exception
+        return False
+
+def snmp_get(host, oid, community=public)
+    try
+        result = subprocess.run([snmpget, -v2c, -c, community, host, oid],
+                                capture_output=True, text=True, timeout=5)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception
+        return None
+
+def get_system_name(host, community=public)
+    output = snmp_get(host, 1.3.6.1.2.1.1.5.0, community)
+    return output.split(STRING)[1].strip().strip('').strip(') if output and STRING in output else output
+
+def dump_all_interfaces(host, community=public)
+    try
+        result = subprocess.run([snmpwalk, -v2c, -c, community, host, 1.3.6.1.2.1.2.2.1.2],
+                                capture_output=True, text=True, timeout=5)
+        return result.stdout.strip().split(n) if result.returncode == 0 else []
+    except Exception
+        return []
+
+def get_interface_index_from_dump(lines, target_name)
+    for line in lines
+        parts = line.split( = )
+        if len(parts)  2
+            continue
+        oid_part, value_part = parts[0], parts[1]
+        if target_name.lower() in value_part.lower()
+            return oid_part.strip().split(.)[-1]
+    return None
+
+def is_interface_up(host, if_index, community=public)
+    oid = f1.3.6.1.2.1.2.2.1.8.{if_index}
+    output = snmp_get(host, oid, community)
+    return bool(output and INTEGER 1 in output)
+
+def get_interface_description(host, if_index, community=public)
+    oid = f1.3.6.1.2.1.31.1.1.1.18.{if_index}
+    output = snmp_get(host, oid, community)
+    return output.split(STRING)[1].strip().strip('').strip(') if output and STRING in output else 
+
+def is_default_huawei_desc(desc, if_name)
+    norm = re.sub(rs+,  , desc.strip())
+    if not norm
+        return True
+    default_str = fHUAWEI, AR Series, {if_name} Interface
+    return norm.lower() == default_str.lower()
+
+def expand_targets(targets)
+    all_hosts = []
+    for target in targets
+        try
+            net = ipaddress.ip_network(target, strict=False)
+            all_hosts.extend(str(host) for host in net.hosts())
+        except ValueError
+            pass
+    return all_hosts
+
+def main()
+    targets = [10.197.0.025, 10.197.0.12826]
+    community = EXPL-IN-GOA
+    output_file = textfolderar651_filtered_switches.txt
+    all_ips = expand_targets(targets)
+
+    with open(output_file, w) as outf
+        for ip_str in all_ips
+            if not ping_host(ip_str)
+                print(f{ip_str} — Unreachable)
+                continue
+
+            sys_name = get_system_name(ip_str, community)
+            if not sys_name
+                print(f{ip_str} — Pingable but SNMP failed)
+                continue
+
+            ifdescr_lines = dump_all_interfaces(ip_str, community)
+            idx_g8 = get_interface_index_from_dump(ifdescr_lines, GigabitEthernet008)
+            idx_g9 = get_interface_index_from_dump(ifdescr_lines, GigabitEthernet009)
+
+            if not all([idx_g8, idx_g9])
+                print(f{ip_str} — Pingable but missing interface indexes)
+                continue
+
+            g8_up = is_interface_up(ip_str, idx_g8, community)
+            g9_up = is_interface_up(ip_str, idx_g9, community)
+
+            g8_desc = get_interface_description(ip_str, idx_g8, community)
+            g9_desc = get_interface_description(ip_str, idx_g9, community)
+
+            ge8_custom = (not g8_up) and (not is_default_huawei_desc(g8_desc, GigabitEthernet008))
+            ge9_custom = (not g9_up) and (not is_default_huawei_desc(g9_desc, GigabitEthernet009))
+            ge8_default = (not g8_up) and is_default_huawei_desc(g8_desc, GigabitEthernet008)
+            ge9_default = (not g9_up) and is_default_huawei_desc(g9_desc, GigabitEthernet009)
+
+            if ge8_custom or ge9_custom
+                outf.write(f{ip_str} - {sys_name} - 1 link downn)
+                outf.flush()
+                print(f{ip_str} — Added (1 link down))
+            elif ge8_default
+                outf.write(f{ip_str} - {sys_name} - GE008 down (default desc) → 2nd link not providedn)
+                outf.flush()
+                print(f{ip_str} — Added (GE008 default))
+            elif ge9_default
+                outf.write(f{ip_str} - {sys_name} - GE009 down (default desc) → 2nd link not providedn)
+                outf.flush()
+                print(f{ip_str} — Added (GE009 default))
+            else
+                print(f{ip_str} — Pingable but no match)
+
+    print(fn✅ Scan completed. Results saved to {output_file})
+
+if __name__ == __main__
+    main()
+
+[END OF SCRIPT]
