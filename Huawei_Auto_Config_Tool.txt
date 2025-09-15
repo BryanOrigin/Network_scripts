@@ -1,0 +1,687 @@
+
+# Huawei Console Auto-Config Tool  
+
+## Overview  
+This tool automates the **initial configuration of brand new Huawei routers/switches** using a console cable connection.  
+
+Instead of manually entering 40+ commands, the script applies a predefined configuration in just a few seconds.  
+⏱ Saves **30–40 minutes** per device during deployment.  
+
+It supports both **GUI mode** and **CLI mode**.  
+You only need to provide:  
+- **Router ID (Loopback IP)**  
+- **Router Name (sysname)**  
+- **Login credentials** (default: `admin / Noc@1235`)  
+
+The tool handles:  
+- Serial port detection (auto-detects available COM ports)  
+- Login (username/password)  
+- Entering system-view (config mode)  
+- Applying configuration templates (LLDP, TACACS, BFD, OSPF, MPLS, SNMP, NTP, SSH, etc.)  
+- Saving results to log file  
+
+---
+
+## Features  
+✅ Auto-detects available **COM ports**  
+✅ GUI interface (simple form: Router Name + Router ID + COM port)  
+✅ Validates inputs (IP format, router name length/characters, COM port availability)  
+✅ Applies standard Huawei baseline configuration automatically  
+✅ Handles **login prompts** and **auto-config [y/n] questions**  
+✅ Logging to `huawei_config.log` (errors, responses, progress)  
+✅ Error-tolerant (allows a few command errors without aborting)  
+
+---
+
+##  Source Code (Python)  
+
+import serial
+import time
+import sys
+import re
+import argparse
+import logging
+import os
+from serial.tools import list_ports
+
+# Configure minimal logging - only for errors and critical info
+logging.basicConfig(
+    level=logging.ERROR,  # Changed from INFO to ERROR
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("huawei_config.log"),
+        logging.StreamHandler()
+    ]
+)
+
+def validate_com_port(port):
+    """Validate if the COM port exists and is available"""
+    available_ports = [p.device for p in list_ports.comports()]
+    
+    if not available_ports:
+        return False, "No COM ports detected on this system."
+    
+    if port not in available_ports:
+        return False, f"COM port {port} not found. Available ports: {', '.join(available_ports)}"
+    
+    try:
+        # Try to open the port to check if it's available
+        test_ser = serial.Serial(port, timeout=0.1)
+        test_ser.close()
+        return True, f"COM port {port} is valid and available."
+    except serial.SerialException:
+        return False, f"COM port {port} exists but is in use or unavailable."
+
+def send_command(ser, command, wait_time=0.5):
+    """Send a command to the serial connection and wait for response"""
+    # Only log errors and critical commands
+    ser.write((command + '\r').encode())
+    time.sleep(wait_time)
+    output = read_output(ser)
+    
+    # Log only if there's an error
+    if "Error" in output:
+        logging.error(f"Error executing command '{command}': {output}")
+    
+    return output
+
+def read_output(ser, timeout=1.0):
+    """Read output from the serial connection"""
+    output = b''
+    start_time = time.time()
+    
+    while (time.time() - start_time) < timeout:
+        if ser.in_waiting > 0:
+            chunk = ser.read(ser.in_waiting)
+            output += chunk
+            if chunk:
+                start_time = time.time()
+        else:
+            time.sleep(0.05)
+    
+    return output.decode('utf-8', errors='ignore')
+
+
+def check_initial_state(ser):
+    """Check the initial state of the connection and determine next steps"""
+    # Reduced wait time
+    wait_time = 3
+    time.sleep(wait_time)
+    
+    ser.write(b'\r')
+    time.sleep(1)
+    
+    output = read_output(ser)
+    
+    # Check for different possible states
+    if "[Huawei]" in output:
+        return "config_mode", output
+    elif "<Huawei>" in output:
+        return "ready", output
+    elif "Username" in output:
+        return "login", output
+    elif "Error: Enter y or n before pressing ENTER" in output or ("Auto-Config" in output and "[y/n]" in output):
+        ser.write(b'n\r')
+        time.sleep(1)
+        output = read_output(ser)
+        
+        if "<Huawei>" in output:
+            return "ready", output
+        else:
+            logging.error("Failed to respond to Auto-Config prompt")
+            return "error", output
+    # Try pressing Enter again for other scenarios
+    else:
+        ser.write(b'\r')
+        time.sleep(1)
+        output = read_output(ser)
+        
+        if "[Huawei]" in output:
+            return "config_mode", output
+        elif "<Huawei>" in output:
+            return "ready", output
+        elif "Username" in output:
+            return "login", output
+        elif "Error: Enter y or n before pressing ENTER" in output or ("Auto-Config" in output and "[y/n]" in output):
+            ser.write(b'n\r')
+            time.sleep(1)
+            output = read_output(ser)
+            
+            if "<Huawei>" in output:
+                return "ready", output
+        
+        logging.error("Could not determine device state")
+        return "unknown", output
+
+
+def login(ser, username, password, initial_output=""):
+    """Handle the login process"""
+    output = initial_output
+    
+    # If we already have username prompt in initial output, process it
+    if "Username" in output:
+        ser.write((username + '\r').encode())
+        time.sleep(0.5)
+    else:
+        # Otherwise wait for username prompt
+        output = read_output(ser)
+        
+        if "Username" in output:
+            ser.write((username + '\r').encode())
+            time.sleep(0.5)
+        else:
+            logging.error("Username prompt not found!")
+            return False, ""
+    
+    # Wait for password prompt
+    output = read_output(ser)
+    
+    if "Password" in output:
+        ser.write((password + '\r').encode())
+        time.sleep(1)
+    else:
+        logging.error("Password prompt not found!")
+        return False, ""
+    
+    # Check if login succeeded
+    login_output = read_output(ser)
+    
+    if "[Huawei]" in login_output:
+        return True, login_output
+    elif "<Huawei>" in login_output:
+        return True, login_output
+    elif "Auto-Config" in login_output and "[y/n]" in login_output:
+        ser.write(b'n\r')
+        time.sleep(1)
+        output = read_output(ser)
+        
+        if "<Huawei>" in output:
+            return True, output
+    
+    logging.error("Login failed or unexpected response!")
+    return False, ""
+
+
+def enter_global_config_mode(ser):
+    """Enter global configuration mode"""
+    output = send_command(ser, "system-view")
+    
+    if "[Huawei]" in output:
+        return True
+    else:
+        logging.error("Failed to enter global configuration mode")
+        return False
+
+
+def exit_config_mode(ser):
+    """Exit configuration mode back to system view"""
+    output = send_command(ser, "quit")
+    
+    if "<Huawei>" in output:
+        return True
+    else:
+        logging.error("Failed to exit configuration mode")
+        return False
+
+
+def apply_configuration(ser, router_name, router_ip, password):
+    """Apply the configuration commands"""
+    logging.info(f"Applying configuration for router: {router_name}, IP: {router_ip}")
+    # Pre-process commands into batches for more efficient processing
+    commands_part1 = [
+        f" sysname {router_name}",
+        f"router id {router_ip}",
+        " lldp enable",
+        "hwtacacs-server template ts-aaa",
+        " hwtacacs-server authentication 10.25.25.2",
+        " hwtacacs-server authorization 10.25.25.2",
+        " hwtacacs-server accounting 10.25.25.2",
+        " hwtacacs-server shared-key cipher localkey",
+        " undo hwtacacs-server user-name domain-included",
+        "bfd",
+        f"mpls lsr-id {router_ip}",
+        "mpls",
+        "mpls l2vpn",
+        "mpls ldp",
+        "mpls ldp remote-peer core",
+        " remote-ip 10.196.0.1",
+        "aaa",
+        " authentication-scheme hwtc-ts",
+        "  authentication-mode local hwtacacs",
+        " authentication-scheme radius",
+        "  authentication-mode radius",
+        " authorization-scheme hwtc-tc",
+        "  authorization-mode local hwtacacs",
+        " accounting-scheme hwtc-tc",
+        "  accounting-mode hwtacacs",
+        " recording-scheme hwtc-tc",
+        " cmd recording-scheme hwtc-tc",
+        " domain expl",
+        "  authentication-scheme hwtc-ts",
+        "  accounting-scheme hwtc-tc",
+        "  authorization-scheme hwtc-tc",
+        "  hwtacacs-server ts-aaa",
+        "interface LoopBack0",
+        f" ip address {router_ip} 255.255.255.255",
+        f"ospf 1 router-id {router_ip}",
+        " bfd all-interfaces enable",
+        " import-route direct",
+        " import-route static",
+        " area 0.0.0.0",
+        "  network 10.199.0.0 0.0.255.255 description backbone",
+        " info-center loghost source LoopBack0",
+        " info-center loghost 10.25.25.58",
+        " snmp-agent community read %^%#BToY'fh+7DaKEFN^9uwRDcy7=2\"\"j.8z8+U5MYZS:P%OS:>\"Q8r3KOO23#p(i4jJYbTLlO`8!834AK)<%^%#",
+        " snmp-agent sys-info version v2c",
+        " snmp-agent permit interface all",
+        " snmp-agent",
+        " ssh server permit interface all",
+        "user-interface con 0"
+    ]
+    
+    commands_part2 = [
+        "user-interface vty 1 4",
+        " authentication-mode aaa",
+        " ntp-service unicast-server 45.116.0.238",
+        " stelnet server enable",
+        "quit",
+        "clock timezone india add 05:30:00"
+    ]
+    
+    # Function to determine correct wait time for each command
+    def get_wait_time(cmd):
+        # Complex commands might need more time
+        if any(keyword in cmd for keyword in ["auth", "hwtacacs", "mpls", "ospf"]):
+            return 0.5
+        # Standard commands need less time
+        return 0.2  # Further reduced from 0.3
+
+    # Process first part of commands
+    success = True
+    error_count = 0
+    
+    # Process first part of commands
+    for command in commands_part1:
+        wait_time = get_wait_time(command)
+        output = send_command(ser, command, wait_time)
+        
+        # Log errors for debugging and track success
+        if "Error" in output:
+            error_count += 1
+            success = False if error_count > 3 else success  # Allow a few errors
+    
+    # Special handling for authentication-mode password and password setting
+    output = send_command(ser, " authentication-mode password", 0.5)
+    
+    # Send command to set authentication password cipher
+    ser.write("set authentication password cipher\r".encode())
+    time.sleep(1)
+    
+    # Wait for password prompt
+    output = read_output(ser)
+    
+    # Check for password prompt and input password
+    if "Enter Password" in output:
+        ser.write((password + '\r').encode())
+        time.sleep(1)
+        
+        # Check for confirmation prompt
+        output = read_output(ser)
+        
+        if "Confirm password" in output:
+            ser.write((password + '\r').encode())
+            time.sleep(1)
+            
+            # Check result
+            output = read_output(ser)
+            if "Error" in output:
+                logging.error(f"Error setting password: {output}")
+                success = False
+    else:
+        logging.error("Password prompt not detected after set authentication password cipher command")
+        success = False
+    
+    # Process second part of commands
+    for command in commands_part2:
+        wait_time = get_wait_time(command)
+        output = send_command(ser, command, wait_time)
+        
+        # Log errors for debugging
+        if "Error" in output:
+            error_count += 1
+            success = False if error_count > 3 else success  # Allow a few errors
+    
+    if success:
+        logging.info("Configuration completed successfully")
+    else:
+        logging.error(f"Configuration completed with {error_count} errors")
+    
+    return success
+
+def validate_ip_address(ip):
+    """Validate if the IP address format is correct"""
+    pattern = re.compile(r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$')
+    match = pattern.match(ip)
+    
+    if not match:
+        return False, "Invalid IP address format"
+    
+    # Check each octet is in range 0-255
+    for octet in match.groups():
+        if int(octet) > 255:
+            return False, "IP address octet out of range (must be 0-255)"
+    
+    return True, "IP address is valid"
+
+def validate_router_name(name):
+    """Validate router name"""
+    if not name or len(name) > 30:
+        return False, "Router name must be between 1 and 30 characters"
+    
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        return False, "Router name should contain only letters, numbers, underscores and hyphens"
+    
+    return True, "Router name is valid"
+
+def gui_interface():
+    """Simple GUI interface for the application"""
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+        
+        def on_submit():
+            # Get values from the form
+            com_port = com_port_var.get()
+            router_name = router_name_var.get()
+            router_ip = router_ip_var.get()
+            username = username_var.get()
+            password = password_var.get()
+            
+            # Validate inputs
+            valid_port, port_msg = validate_com_port(com_port)
+            valid_name, name_msg = validate_router_name(router_name)
+            valid_ip, ip_msg = validate_ip_address(router_ip)
+            
+            if not valid_port:
+                messagebox.showerror("Error", port_msg)
+                return
+            if not valid_name:
+                messagebox.showerror("Error", name_msg)
+                return
+            if not valid_ip:
+                messagebox.showerror("Error", ip_msg)
+                return
+                
+            # Update status
+            status_label.config(text="Configuring router... Please wait.")
+            root.update()
+            
+            try:
+                # Open serial connection
+                ser = serial.Serial(
+                    port=com_port,
+                    baudrate=9600,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.5
+                )
+                
+                # Check initial state
+                state, output = check_initial_state(ser)
+                
+                if state == "login":
+                    # Need to log in
+                    status_label.config(text="Logging in...")
+                    root.update()
+                    login_success, output = login(ser, username, password, output)
+                    if not login_success:
+                        messagebox.showerror("Error", "Login failed.")
+                        ser.close()
+                        status_label.config(text="Ready")
+                        return
+                elif state == "ready":
+                    # Already at command prompt
+                    pass
+                elif state == "config_mode":
+                    # Already in configuration mode
+                    pass
+                elif state == "error" or state == "unknown":
+                    messagebox.showerror("Error", "Could not determine device state.")
+                    ser.close()
+                    status_label.config(text="Ready")
+                    return
+                
+                # Enter global configuration mode if not already there
+                if state != "config_mode":
+                    status_label.config(text="Entering configuration mode...")
+                    root.update()
+                    if not enter_global_config_mode(ser):
+                        messagebox.showerror("Error", "Failed to enter configuration mode.")
+                        ser.close()
+                        status_label.config(text="Ready")
+                        return
+                
+                # Apply configuration
+                status_label.config(text=f"Applying configuration for {router_name}...")
+                root.update()
+                
+                if apply_configuration(ser, router_name, router_ip, password):
+                    messagebox.showinfo("Success", "Configuration applied successfully!")
+                    ser.close()
+                    status_label.config(text="Ready")
+                else:
+                    messagebox.showwarning("Warning", "Configuration completed with errors. Check log file for details.")
+                    ser.close()
+                    status_label.config(text="Ready")
+                    
+            except serial.SerialException as e:
+                messagebox.showerror("Error", f"Serial connection error: {e}")
+                status_label.config(text="Ready")
+            except Exception as e:
+                messagebox.showerror("Error", f"An error occurred: {e}")
+                status_label.config(text="Ready")
+        
+        # Create the main window
+        root = tk.Tk()
+        root.title("Huawei Router Configuration Tool")
+        root.geometry("500x400")
+        
+        # Create a frame for the form
+        main_frame = ttk.Frame(root, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create form elements
+        ttk.Label(main_frame, text="Huawei Router Configuration", font=("Arial", 16)).grid(column=0, row=0, columnspan=2, pady=10)
+        
+        # COM Port selection
+        ttk.Label(main_frame, text="COM Port:").grid(column=0, row=1, sticky=tk.W, pady=5)
+        com_port_var = tk.StringVar()
+        
+        # Get available ports
+        available_ports = [p.device for p in list_ports.comports()]
+        com_port_combo = ttk.Combobox(main_frame, textvariable=com_port_var, values=available_ports)
+        com_port_combo.grid(column=1, row=1, sticky=(tk.W, tk.E), pady=5)
+        if available_ports:
+            com_port_combo.current(0)
+        
+        # Router Name
+        ttk.Label(main_frame, text="Router Name:").grid(column=0, row=2, sticky=tk.W, pady=5)
+        router_name_var = tk.StringVar()
+        ttk.Entry(main_frame, textvariable=router_name_var).grid(column=1, row=2, sticky=(tk.W, tk.E), pady=5)
+        
+        # Router IP
+        ttk.Label(main_frame, text="Router IP:").grid(column=0, row=3, sticky=tk.W, pady=5)
+        router_ip_var = tk.StringVar()
+        ttk.Entry(main_frame, textvariable=router_ip_var).grid(column=1, row=3, sticky=(tk.W, tk.E), pady=5)
+        
+        # Username (with default)
+        ttk.Label(main_frame, text="Username:").grid(column=0, row=4, sticky=tk.W, pady=5)
+        username_var = tk.StringVar(value="admin")
+        ttk.Entry(main_frame, textvariable=username_var).grid(column=1, row=4, sticky=(tk.W, tk.E), pady=5)
+        
+        # Password (with default)
+        ttk.Label(main_frame, text="Password:").grid(column=0, row=5, sticky=tk.W, pady=5)
+        password_var = tk.StringVar(value="Noc@1235")
+        ttk.Entry(main_frame, textvariable=password_var, show="*").grid(column=1, row=5, sticky=(tk.W, tk.E), pady=5)
+        
+        # Submit button
+        ttk.Button(main_frame, text="Configure Router", command=on_submit).grid(column=0, row=6, columnspan=2, pady=20)
+        
+        # Status label
+        status_label = ttk.Label(main_frame, text="Ready")
+        status_label.grid(column=0, row=7, columnspan=2)
+        
+        # Configure grid
+        for child in main_frame.winfo_children():
+            child.grid_configure(padx=5)
+        
+        # Run the GUI
+        root.mainloop()
+        return 0
+    except ImportError:
+        print("Tkinter not available. Running in command line mode.")
+        return main()
+
+def main():
+    parser = argparse.ArgumentParser(description='Configure Huawei router via console connection')
+    parser.add_argument('--port', required=True, help='COM port (e.g., COM3 on Windows, /dev/ttyUSB0 on Linux)')
+    parser.add_argument('--baudrate', type=int, default=9600, help='Baud rate (default: 9600)')
+    parser.add_argument('--username', default='admin', help='Login username (default: admin)')
+    parser.add_argument('--password', default='Noc@1235', help='Login password (default: Noc@1235)')
+    parser.add_argument('--router-name', required=True, help='Router name for configuration')
+    parser.add_argument('--router-ip', required=True, help='Router IP address for configuration')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--gui', action='store_true', help='Launch GUI interface')
+    
+    # Check if running in interactive mode (no arguments passed)
+    if len(sys.argv) == 1:
+        return gui_interface()
+    
+    args = parser.parse_args()
+    
+    # If GUI flag is set, launch GUI
+    if args.gui:
+        return gui_interface()
+    
+    # Set debug level if requested
+    if args.debug:
+        logging.getLogger().setLevel(logging.INFO)
+        print("Debug logging enabled")
+    
+    # Validate inputs
+    valid_ip, ip_msg = validate_ip_address(args.router_ip)
+    if not valid_ip:
+        print(f"Error: {ip_msg}")
+        return 1
+    
+    valid_name, name_msg = validate_router_name(args.router_name)
+    if not valid_name:
+        print(f"Error: {name_msg}")
+        return 1
+    
+    valid_port, port_msg = validate_com_port(args.port)
+    if not valid_port:
+        print(f"Error: {port_msg}")
+        return 1
+    
+    try:
+        # Open serial connection with optimized settings
+        print(f"Opening serial connection to {args.port} at {args.baudrate} baud")
+        ser = serial.Serial(
+            port=args.port,
+            baudrate=args.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.5
+        )
+        
+        # Check the initial state of the connection
+        state, output = check_initial_state(ser)
+        print(f"Device state: {state}")
+        
+        if state == "login":
+            # Need to log in
+            print("Logging in...")
+            login_success, output = login(ser, args.username, args.password, output)
+            if not login_success:
+                print("Login failed. Exiting.")
+                ser.close()
+                return 1
+        elif state == "ready":
+            # Already at command prompt
+            print("Device ready. No login needed.")
+        elif state == "config_mode":
+            # Already in configuration mode
+            print("Device already in configuration mode.")
+        elif state == "error" or state == "unknown":
+            print(f"Error: Could not determine device state.")
+            ser.close()
+            return 1
+        
+        # Enter global configuration mode if not already there
+        if state != "config_mode":
+            print("Entering configuration mode...")
+            if not enter_global_config_mode(ser):
+                print("Failed to enter configuration mode. Exiting.")
+                ser.close()
+                return 1
+        
+        # Apply configuration
+        print(f"Applying configuration for {args.router_name} ({args.router_ip})...")
+        if apply_configuration(ser, args.router_name, args.router_ip, args.password):
+            print("Configuration applied successfully!")
+            # Close the connection
+            ser.close()
+            print("Done.")
+            return 0
+        else:
+            print("Warning: Configuration completed with errors. Check log file for details.")
+            ser.close()
+            return 1
+        
+    except serial.SerialException as e:
+        print(f"Error: Serial connection error: {e}")
+        logging.error(f"Serial connection error: {e}")
+        return 1
+    except Exception as e:
+        print(f"Error: {e}")
+        logging.error(f"An error occurred: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+        return 1
+
+if __name__ == "__main__":
+    # If no args provided, launch GUI by default
+    if len(sys.argv) == 1:
+        exit_code = gui_interface()
+    else:
+        exit_code = main()
+    sys.exit(exit_code)
+
+---
+
+## Build as `.exe`  
+You can package this script as a standalone Windows `.exe` (no Python required) using **PyInstaller**:  
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --noconsole huawei_config.py
+```
+
+This generates:  
+```
+dist/HuaweiConfigTool.exe
+```
+
+Now you can run it directly on any Windows PC.  
+
+---
+
+## Notes  
+- First account must exist on the Huawei device (default: `admin / Noc@1235`)  
+- Ensure baud rate is set to **9600** (default)  
+- Designed for **new deployments** – overwrites baseline config  
+- Supports Huawei **AR651 routers** and similar devices  
+
