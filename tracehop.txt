@@ -1,0 +1,331 @@
+============================================================
+Huawei L3 Traceroute Automation Tool
+============================================================
+
+Author: Bryan Rodriguez
+Version: 1.0
+Date: September 2025
+
+------------------------------------------------------------
+Overview
+------------------------------------------------------------
+In our network, all backbone links are configured as /30 point-to-point (p2p) interfaces. 
+When running a traceroute, each hop reveals the *interface IP* instead of the loopback IP. 
+
+This causes two big issues:
+1. We cannot directly resolve traceroute hops via DNS (loopbacks are usually in DNS, not p2p IPs).
+2. Troubleshooting becomes cumbersome because you need to manually SSH into each switch to 
+   figure out its hostname and router ID.
+
+This tool automates that process.
+
+------------------------------------------------------------
+Key Features
+------------------------------------------------------------
+✅ Run traceroute from core or any source switch to a destination IP.  
+✅ Parse all hop IPs dynamically, even in multi-hop L3 environments.  
+✅ Use SSH (via Netmiko) to log in to each hop device in parallel.  
+✅ Fetch hostname (`sysname`) and router ID automatically.  
+✅ Print a colorized path (with hostname, interface IP, and router ID).  
+✅ Works in highly dynamic environments where p2p links change often.  
+
+------------------------------------------------------------
+How It Works
+------------------------------------------------------------
+1. Script logs in to the core (or source) switch.  
+2. Runs `tracert <destination>` to get hop-by-hop interface IPs.  
+3. For each hop:
+   - SSH into the hop switch (parallelized with ThreadPoolExecutor).
+   - Run commands to fetch hostname and router ID.
+4. Prints a structured, colorized path from start → hops → destination.
+
+------------------------------------------------------------
+Why This Matters
+------------------------------------------------------------
+- Traceroute normally shows only p2p interface IPs, which are not human-friendly.
+- Instead of manual lookups, this tool gives:
+   Hostname + Interface IP + Router ID
+- Reduces troubleshooting time significantly in large ISP backbones.
+
+------------------------------------------------------------
+Example Output
+------------------------------------------------------------
+Complete path:
+Start: Core_SW_S12700E_8 (10.196.0.1) [Router ID: 10.196.0.1]
+→ Pinto_Rosario (10.199.7.234) [Router ID: 10.196.0.11]
+→ Glenmark_L3_sw (10.199.10.161) [Router ID: 10.196.0.80]
+→ Intech_sw (10.199.15.57) [Router ID: 10.196.0.26]
+→ Redkar_SW (10.199.14.222) [Router ID: 10.196.0.33]
+→ Pernem_Church_10G_SW (10.199.7.50) [Router ID: 10.196.0.23]
+→ Mandrem_Luis_SW (10.199.0.129) [Router ID: 10.196.0.22]
+→ Azora_by_Ayatana (10.197.0.120) [Router ID: 10.197.0.120]
+
+------------------------------------------------------------
+Requirements
+------------------------------------------------------------
+- Python 3.8+
+- Libraries:
+    pip install netmiko
+- Network access to switches (SSH enabled)
+- Huawei devices with supported CLI
+
+------------------------------------------------------------
+Convert to Executable (.exe)
+------------------------------------------------------------
+1. Install pyinstaller:
+   pip install pyinstaller
+
+2. Build executable:
+   pyinstaller --onefile HuaweiTraceroute.py
+
+3. The .exe file will be located in the `dist/` folder.
+
+This makes the tool easy to run on any Windows system without Python installed.
+
+------------------------------------------------------------
+Full Python Source Code
+------------------------------------------------------------
+import re
+from netmiko import ConnectHandler
+import getpass
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+# ANSI Color codes
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    MAGENTA = '\033[35m'
+
+def colorize_path(hostname, ip, router_id, is_start=False):
+    if is_start:
+        return (f"{Colors.HEADER}{Colors.BOLD}Start: {Colors.YELLOW}{hostname} "
+                f"({Colors.GREEN}{ip}) {Colors.BLUE}[Router ID: {Colors.ENDC}{router_id}]{Colors.ENDC}")
+    else:
+        return (f"{Colors.BOLD}→ {Colors.YELLOW}{hostname} "
+                f"({Colors.GREEN}{ip}) {Colors.BLUE}[Router ID: {Colors.ENDC}{router_id}]{Colors.ENDC}")
+
+def connect_to_switch(ip_address, username, password, command=None, verbose=False):
+    try:
+        device = {
+            'device_type': 'huawei',
+            'ip': ip_address,
+            'username': username,
+            'password': password,
+            'timeout': 20
+        }
+        
+        if verbose:
+            print(f"\nConnecting to {ip_address}...")
+        
+        with ConnectHandler(**device) as ssh:
+            hostname = ssh.send_command('display current-configuration | include sysname')
+            router_id_output = ssh.send_command('display router id')
+            
+            hostname = hostname.replace('sysname ', '').strip()
+            router_id = extract_router_id(router_id_output)
+            
+            if command:
+                if verbose:
+                    print(f"Executing command: {command}")
+                output = ssh.send_command(command, expect_string=r"[>#]", delay_factor=2)
+                return hostname, router_id, output
+            
+            return hostname, router_id, None
+            
+    except Exception as e:
+        if verbose:
+            print(f"Error connecting to {ip_address}: {e}")
+        return None, None, None
+
+def extract_router_id(output):
+    match = re.search(r'RouterID:(\d+\.\d+\.\d+\.\d+)', output)
+    if match:
+        return match.group(1)
+    return "N/A"
+
+def extract_ip_addresses(traceroute_output):
+    ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+    lines = traceroute_output.split('\n')
+    hops = []
+    
+    for line in lines:
+        if re.search(r'^\s*\d+\s', line):
+            ips = re.findall(ip_pattern, line)
+            if ips:
+                hops.append(ips[0])
+    
+    return hops
+
+def get_switch_info(ip_address, username, password):
+    hostname, router_id, _ = connect_to_switch(ip_address, username, password, verbose=False)
+    return ip_address, hostname, router_id
+
+def print_colored_traceroute(traceroute_output):
+    lines = traceroute_output.split('\n')
+    colored_output = []
+    
+    for line in lines:
+        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        colored_line = re.sub(ip_pattern, f"{Colors.YELLOW}\\g<0>{Colors.ENDC}", line)
+        colored_output.append(colored_line)
+    
+    print("\n".join(colored_output))
+
+def trace_path(username, password, dest_ip):
+    CORE_SWITCH_IP = "10.196.0.1"
+    
+    print(f"\n{Colors.HEADER}Connecting to core switch {Colors.YELLOW}{CORE_SWITCH_IP}{Colors.ENDC}...")
+    core_hostname, core_router_id, traceroute_output = connect_to_switch(
+        CORE_SWITCH_IP, 
+        username, 
+        password, 
+        f"tracert {dest_ip}",
+        verbose=True
+    )
+    
+    if not core_hostname or not traceroute_output:
+        print(f"{Colors.RED}Failed to connect to core switch or perform traceroute{Colors.ENDC}")
+        return
+    
+    print(f"\n{Colors.BOLD}Traceroute output:{Colors.ENDC}")
+    print_colored_traceroute(traceroute_output)
+    
+    hop_ips = []
+    seen_ips = set()
+    lines = traceroute_output.split('\n')
+    
+    for line in lines:
+        if re.search(r'^\s*\d+\s', line):
+            ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+            ips = re.findall(ip_pattern, line)
+            if ips and ips[0] not in seen_ips:
+                hop_ips.append(ips[0])
+                seen_ips.add(ips[0])
+    
+    switches_info = {CORE_SWITCH_IP: (core_hostname, core_router_id)}
+    
+    with ThreadPoolExecutor(max_workers=len(hop_ips)) as executor:
+        future_to_ip = {
+            executor.submit(get_switch_info, ip, username, password): ip 
+            for ip in hop_ips
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                ip, hostname, router_id = future.result()
+                if hostname:
+                    switches_info[ip] = (hostname, router_id)
+            except Exception as e:
+                print(f"{Colors.RED}Error processing {ip}: {e}{Colors.ENDC}")
+    
+    print(f"\n{Colors.BOLD}Complete path:{Colors.ENDC}")
+    print(colorize_path(core_hostname, CORE_SWITCH_IP, core_router_id, is_start=True))
+    
+    for hop_ip in hop_ips:
+        hostname, router_id = switches_info.get(hop_ip, ("Unknown", "N/A"))
+        print(colorize_path(hostname, hop_ip, router_id))
+
+def trace_path_from_source_to_destination(username, password, source_ip, dest_ip):
+    print(f"\n{Colors.HEADER}Connecting to source switch {Colors.YELLOW}{source_ip}{Colors.ENDC}...")
+    source_hostname, source_router_id, traceroute_output = connect_to_switch(
+        source_ip, 
+        username, 
+        password, 
+        f"tracert {dest_ip}",
+        verbose=True
+    )
+    
+    if not source_hostname or not traceroute_output:
+        print(f"{Colors.RED}Failed to connect to source switch or perform traceroute{Colors.ENDC}")
+        return
+    
+    print(f"\n{Colors.BOLD}Traceroute output:{Colors.ENDC}")
+    print_colored_traceroute(traceroute_output)
+    
+    hop_ips = []
+    seen_ips = set()
+    lines = traceroute_output.split('\n')
+    
+    for line in lines:
+        if re.search(r'^\s*\d+\s', line):
+            ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+            ips = re.findall(ip_pattern, line)
+            if ips and ips[0] not in seen_ips:
+                hop_ips.append(ips[0])
+                seen_ips.add(ips[0])
+    
+    switches_info = {source_ip: (source_hostname, source_router_id)}
+    
+    with ThreadPoolExecutor(max_workers=len(hop_ips)) as executor:
+        future_to_ip = {
+            executor.submit(get_switch_info, ip, username, password): ip 
+            for ip in hop_ips
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                ip, hostname, router_id = future.result()
+                if hostname:
+                    switches_info[ip] = (hostname, router_id)
+            except Exception as e:
+                print(f"{Colors.RED}Error processing {ip}: {e}{Colors.ENDC}")
+    
+    print(f"\n{Colors.BOLD}Complete path:{Colors.ENDC}")
+    print(colorize_path(source_hostname, source_ip, source_router_id, is_start=True))
+    
+    for hop_ip in hop_ips:
+        hostname, router_id = switches_info.get(hop_ip, ("Unknown", "N/A"))
+        print(colorize_path(hostname, hop_ip, router_id))
+
+def main():
+    username = input(f"{Colors.CYAN}Enter username: {Colors.ENDC}")
+    password = getpass.getpass(f"{Colors.CYAN}Enter password: {Colors.ENDC}")
+    
+    while True:
+        try:
+            print("\nOptions:")
+            print("1. Trace path from core switch")
+            print("2. Trace path from source switch to destination switch")
+            print("3. Exit")
+            
+            option = input(f"{Colors.CYAN}Enter your choice: {Colors.ENDC}")
+            
+            if option == "1":
+                dest_ip = input(f"{Colors.CYAN}Enter the destination IP: {Colors.ENDC}")
+                trace_path(username, password, dest_ip)
+                
+            elif option == "2":
+                source_ip = input(f"{Colors.CYAN}Enter the source switch IP: {Colors.ENDC}")
+                dest_ip = input(f"{Colors.CYAN}Enter the destination switch IP: {Colors.ENDC}")
+                trace_path_from_source_to_destination(username, password, source_ip, dest_ip)
+                
+            elif option == "3":
+                print(f"\n{Colors.GREEN}Exiting program. Goodbye!{Colors.ENDC}")
+                break
+                
+            else:
+                print(f"{Colors.RED}Invalid option. Please choose again.{Colors.ENDC}")
+                
+        except KeyboardInterrupt:
+            print(f"\n\n{Colors.YELLOW}Program interrupted by user.{Colors.ENDC}")
+            break
+        except Exception as e:
+            print(f"\n{Colors.RED}An error occurred: {e}{Colors.ENDC}")
+            continue
+
+if __name__ == "__main__":
+    main()
+
+------------------------------------------------------------
+End of File
+------------------------------------------------------------
